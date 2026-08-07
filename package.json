@@ -1,15 +1,17 @@
 {
-  "name": "react-vite-tailwind",
+  "name": "obj-to-3js-tool",
   "private": true,
-  "version": "0.0.0",
+  "version": "1.0.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "tsx --test tests/*.test.ts",
+    "test:visual": "tsx tests/visual-critic.ts",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@types/three": "^0.185.4",
     "clsx": "2.1.1",
     "react": "19.2.6",
     "react-dom": "19.2.6",
@@ -21,8 +23,10 @@
     "@types/node": "22.19.17",
     "@types/react": "19.2.7",
     "@types/react-dom": "19.2.3",
+    "@types/three": "^0.185.4",
     "@vitejs/plugin-react": "5.1.1",
     "tailwindcss": "4.1.17",
+    "tsx": "4.23.11",
     "typescript": "5.9.3",
     "vite": "7.3.2",
     "vite-plugin-singlefile": "2.3.0"
