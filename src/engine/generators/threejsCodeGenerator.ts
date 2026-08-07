@@ -1,0 +1,312 @@
+/**
+ * threejsCodeGenerator.ts — emits standalone, idiomatic Three.js TypeScript
+ * from an AnalysisResult. The output only depends on `three` and exposes a
+ * single `createProceduralPart()` that returns a `THREE.Group`.
+ *
+ * Four reconstruction strategies, matching AnalysisResult.mode:
+ *   - obb_primitives  : PCA-oriented BoxGeometry per box-like part (angled
+ *                       features keep their angle via the part quaternion).
+ *   - convex_hulls    : per-part QuickHull emitted as an indexed BufferGeometry.
+ *   - indexed_buffer  : lossless exact BufferGeometry of the whole mesh.
+ *   - hybrid          : oriented boxes where the OBB fits, exact indexed
+ *                       geometry for everything else.
+ */
+
+import type { AnalysisResult, ConversionSettings, MeshData, PartInfo, Vec3 } from "../../types/engine";
+import { cross, dot, length, normalize, sub, vec } from "../../utils/pcaMath";
+import { convexHull } from "../decomposition/convexHull";
+
+export interface GeneratedCode {
+  code: string;
+  bytes: number;
+  primitiveCount: number;
+  /** Indexed vertex count for buffer-based modes (0 for pure OBB output). */
+  vertexCount: number;
+}
+
+/* ----------------------------- formatting ------------------------------ */
+
+function f(value: number): string {
+  const rounded = Math.round(value * 1e5) / 1e5;
+  if (Number.isInteger(rounded) && Math.abs(rounded) < 1e6) return `${rounded}.0`;
+  return String(rounded);
+}
+
+/** Format a flat number array into chunked, indented source lines. */
+function formatArray(values: number[], perLine = 3, indent = "    "): string {
+  const lines: string[] = [];
+  for (let i = 0; i < values.length; i += perLine) {
+    const chunk = values.slice(i, i + perLine).map(f).join(", ");
+    lines.push(`${indent}${chunk},`);
+  }
+  return lines.join("\n");
+}
+
+function safeName(name: string): string {
+  return name.replace(/\.[^.]+$/, "").replace(/[^a-zA-Z0-9_-]/g, "_") || "parametric_part";
+}
+
+/* --------------------------- geometry helpers -------------------------- */
+
+function faceNormal(mesh: MeshData, face: [number, number, number]): Vec3 {
+  const a = mesh.vertices[face[0]];
+  const b = mesh.vertices[face[1]];
+  const c = mesh.vertices[face[2]];
+  return normalize(cross(sub(b, a), sub(c, a)));
+}
+
+export interface IndexedGeometry {
+  positions: number[];
+  normals: number[];
+  indices: number[];
+}
+
+/** Build welded, indexed geometry for a face subset with smooth or flat normals. */
+export function buildIndexedGeometry(
+  mesh: MeshData,
+  faceIds: number[],
+  smoothing: boolean,
+): IndexedGeometry {
+  if (smoothing) {
+    const key = (v: Vec3) => `${Math.round(v.x * 1e6)}:${Math.round(v.y * 1e6)}:${Math.round(v.z * 1e6)}`;
+    const weld = new Map<string, number>();
+    const positions: number[] = [];
+    const accum = new Map<number, Vec3>();
+    const indices: number[] = [];
+
+    const indexFor = (v: Vec3): number => {
+      const k = key(v);
+      const existing = weld.get(k);
+      if (existing !== undefined) return existing;
+      const idx = positions.length / 3;
+      positions.push(v.x, v.y, v.z);
+      weld.set(k, idx);
+      accum.set(idx, vec());
+      return idx;
+    };
+
+    for (const faceId of faceIds) {
+      const face = mesh.faces[faceId];
+      if (!face) continue;
+      const n = faceNormal(mesh, face);
+      const i0 = indexFor(mesh.vertices[face[0]]);
+      const i1 = indexFor(mesh.vertices[face[1]]);
+      const i2 = indexFor(mesh.vertices[face[2]]);
+      const area = length(cross(sub(mesh.vertices[face[1]], mesh.vertices[face[0]]), sub(mesh.vertices[face[2]], mesh.vertices[face[0]]))) * 0.5;
+      for (const idx of [i0, i1, i2]) {
+        const cur = accum.get(idx)!;
+        accum.set(idx, vec(cur.x + n.x * area, cur.y + n.y * area, cur.z + n.z * area));
+      }
+      indices.push(i0, i1, i2);
+    }
+
+    const normals: number[] = new Array(positions.length).fill(0);
+    accum.forEach((n, idx) => {
+      const nn = length(n) > 1e-12 ? normalize(n) : vec(0, 1, 0);
+      normals[idx * 3] = nn.x;
+      normals[idx * 3 + 1] = nn.y;
+      normals[idx * 3 + 2] = nn.z;
+    });
+
+    return { positions, normals, indices };
+  }
+
+  // Flat shading: 3 dedicated vertices per triangle.
+  const positions: number[] = [];
+  const normals: number[] = [];
+  const indices: number[] = [];
+  for (const faceId of faceIds) {
+    const face = mesh.faces[faceId];
+    if (!face) continue;
+    const n = faceNormal(mesh, face);
+    const base = positions.length / 3;
+    for (const vi of face) {
+      const v = mesh.vertices[vi];
+      positions.push(v.x, v.y, v.z);
+      normals.push(n.x, n.y, n.z);
+    }
+    indices.push(base, base + 1, base + 2);
+  }
+  return { positions, normals, indices };
+}
+
+/* ----------------------------- emitters -------------------------------- */
+
+function header(name: string, mode: string): string[] {
+  return [
+    '/**',
+    ` * Auto-generated by Obj-to-3js-tool — reconstruction mode: ${mode}.`,
+    " * Standalone: only depends on `three`. Returns a THREE.Group.",
+    " */",
+    'import * as THREE from "three";',
+    "",
+    "export function createProceduralPart(): THREE.Group {",
+    `  const root = new THREE.Group();`,
+    `  root.name = "${safeName(name)}";`,
+    "  const material = new THREE.MeshStandardMaterial({",
+    "    color: 0x8fa5a5, metalness: 0.62, roughness: 0.34, side: THREE.DoubleSide,",
+    "  });",
+  ];
+}
+
+function emitObbBox(part: PartInfo): string {
+  const [qx, qy, qz, qw] = part.quaternion;
+  return [
+    "  {",
+    "    const geometry = new THREE.BoxGeometry(" +
+      `${f(part.size.x)}, ${f(part.size.y)}, ${f(part.size.z)});`,
+    "    const mesh = new THREE.Mesh(geometry, material);",
+    `    mesh.position.set(${f(part.center.x)}, ${f(part.center.y)}, ${f(part.center.z)});`,
+    `    mesh.quaternion.set(${f(qx)}, ${f(qy)}, ${f(qz)}, ${f(qw)});`,
+    "    root.add(mesh);",
+    "  }",
+  ].join("\n");
+}
+
+function emitIndexedGeometryBlock(
+  geom: IndexedGeometry,
+  varName: string,
+  centerOffset: Vec3 | null,
+): string {
+  const offsetOp = centerOffset
+    ? `    ${varName}Geo.translate(${f(-centerOffset.x)}, ${f(-centerOffset.y)}, ${f(-centerOffset.z)});\n`
+    : "";
+  return [
+    `  const ${varName}Geo = new THREE.BufferGeometry();`,
+    `  ${varName}Geo.setAttribute("position", new THREE.Float32BufferAttribute([`,
+    formatArray(geom.positions, 3, "      "),
+    `    ], 3));`,
+    `  ${varName}Geo.setAttribute("normal", new THREE.Float32BufferAttribute([`,
+    formatArray(geom.normals, 3, "      "),
+    `    ], 3));`,
+    `  ${varName}Geo.setIndex([`,
+    formatArray(geom.indices, 12, "      "),
+    `    ]);`,
+    offsetOp,
+    `  const ${varName}Mesh = new THREE.Mesh(${varName}Geo, material);`,
+    `  root.add(${varName}Mesh);`,
+  ].join("\n");
+}
+
+function emitObbPrimitives(mesh: MeshData, result: AnalysisResult): GeneratedCode {
+  const lines = header(mesh.name, "obb_primitives");
+  let count = 0;
+  for (const part of result.parts) {
+    lines.push(emitObbBox(part));
+    count += 1;
+  }
+  lines.push("  return root;", "}");
+  const code = lines.join("\n");
+  return { code, bytes: code.length, primitiveCount: count, vertexCount: 0 };
+}
+
+function emitConvexHulls(mesh: MeshData, result: AnalysisResult): GeneratedCode {
+  const lines = header(mesh.name, "convex_hulls");
+  let count = 0;
+  let vertexCount = 0;
+  result.parts.forEach((part, idx) => {
+    const points = part.vertexIds.map((vi) => mesh.vertices[vi]);
+    const hull = convexHull(points);
+    if (hull.triangleCount === 0) {
+      lines.push(emitObbBox(part));
+      count += 1;
+      return;
+    }
+    // Build hull vertex buffer: hull.indices reference input indices, remap locally.
+    const used = [...new Set(hull.indices)];
+    const remap = new Map<number, number>();
+    used.forEach((srcIdx, localIdx) => remap.set(srcIdx, localIdx));
+    const positions: number[] = [];
+    used.forEach((srcIdx) => {
+      const p = points[srcIdx];
+      positions.push(p.x, p.y, p.z);
+    });
+    const indices = hull.indices.map((srcIdx) => remap.get(srcIdx)!);
+    const varName = `hull${idx}`;
+    lines.push(`  // Convex hull of "${part.name}" (${hull.triangleCount} triangles)`);
+    lines.push(`  const ${varName}Geo = new THREE.BufferGeometry();`);
+    lines.push(`  ${varName}Geo.setAttribute("position", new THREE.Float32BufferAttribute([`);
+    lines.push(formatArray(positions, 3, "      "));
+    lines.push(`    ], 3));`);
+    lines.push(`  ${varName}Geo.setIndex([`);
+    lines.push(formatArray(indices, 12, "      "));
+    lines.push(`    ]);`);
+    lines.push(`  ${varName}Geo.computeVertexNormals();`);
+    lines.push(`  root.add(new THREE.Mesh(${varName}Geo, material));`);
+    count += 1;
+    vertexCount += used.length;
+  });
+  lines.push("  return root;", "}");
+  const code = lines.join("\n");
+  return { code, bytes: code.length, primitiveCount: count, vertexCount };
+}
+
+function emitIndexedBuffer(mesh: MeshData, settings: ConversionSettings): GeneratedCode {
+  const lines = header(mesh.name, "indexed_buffer");
+  const faceIds = mesh.faces.map((_, idx) => idx);
+  const geom = buildIndexedGeometry(mesh, faceIds, settings.enableNormalsSmoothing);
+  lines.push(emitIndexedGeometryBlock(geom, "mesh", null));
+  lines.push("  return root;", "}");
+  const code = lines.join("\n");
+  return { code, bytes: code.length, primitiveCount: 1, vertexCount: geom.positions.length / 3 };
+}
+
+function emitHybrid(mesh: MeshData, result: AnalysisResult, settings: ConversionSettings): GeneratedCode {
+  const lines = header(mesh.name, "hybrid (OBB + indexed)");
+  let obbCount = 0;
+  let bufferCount = 0;
+  let vertexCount = 0;
+  result.parts.forEach((part, idx) => {
+    const useBox = part.kind === "obb";
+    if (useBox) {
+      lines.push(`  // Box-like part "${part.name}" (OBB inlier ${(part.obbInlierRatio * 100).toFixed(0)}%)`);
+      lines.push(emitObbBox(part));
+      obbCount += 1;
+    } else {
+      const geom = buildIndexedGeometry(mesh, part.faceIds, settings.enableNormalsSmoothing);
+      lines.push(`  // Free-form part "${part.name}" (${part.faceCount} triangles)`);
+      lines.push(emitIndexedGeometryBlock(geom, `part${idx}`, null));
+      bufferCount += 1;
+      vertexCount += geom.positions.length / 3;
+    }
+  });
+  lines.push("  return root;", "}");
+  const code = lines.join("\n");
+  return { code, bytes: code.length, primitiveCount: obbCount + bufferCount, vertexCount };
+}
+
+export function generateProceduralCode(
+  mesh: MeshData,
+  result: AnalysisResult,
+  settings: ConversionSettings,
+): GeneratedCode {
+  switch (result.mode) {
+    case "obb_primitives":
+      return emitObbPrimitives(mesh, result);
+    case "convex_hulls":
+      return emitConvexHulls(mesh, result);
+    case "indexed_buffer":
+      return emitIndexedBuffer(mesh, settings);
+    case "hybrid":
+    default:
+      return emitHybrid(mesh, result, settings);
+  }
+}
+
+/** Quick reference estimate without emitting full source (used by auto-scoring). */
+export function estimateCodeBytes(mesh: MeshData, mode: string, smoothing: boolean): number {
+  const perVertex = smoothing ? 26 : 36; // position+normal+index chars per vertex
+  switch (mode) {
+    case "indexed_buffer":
+      return 900 + mesh.faces.length * 3 * perVertex;
+    case "obb_primitives":
+      return 900 + mesh.faces.length * 0.4 * 90;
+    case "convex_hulls":
+      return 900 + mesh.faces.length * 0.7 * perVertex;
+    case "hybrid":
+    default:
+      return 900 + mesh.faces.length * 0.6 * perVertex;
+  }
+}
+
+export { dot };
